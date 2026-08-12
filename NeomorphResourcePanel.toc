@@ -1,0 +1,11 @@
+## Interface: 120001, 120005
+## Title: NeomorphResourcePanel
+## Notes: Minimal resource-colored power bar; turns red in combat above a threshold.
+## Author: Neomorph
+## Version: 0.1.1
+## SavedVariables: NeomorphResourcePanelDB
+
+core/DB.lua
+core/Debug.lua
+modules/ResourceBar.lua
+core/Init.lua

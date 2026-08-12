@@ -25,3 +25,7 @@ No older todo or history tracker was present. This repository now tracks the req
 - [Architecture](ARCHITECTURE.md)
 - [Code index](CODE_INDEX.md)
 - [Code graph](CODE_GRAPH.md)
+
+## License
+
+Licensed under the [MIT License](LICENSE). Bundled third-party components remain under their own notices.

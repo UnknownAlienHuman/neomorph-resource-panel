@@ -19,117 +19,214 @@ jobs:
   privatize:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      GH_CONFIG_DIR: /tmp/gh-private-all
     steps:
-      - name: Request one-time GitHub CLI authorization
+      - name: Authorize once, make every owned repository private, and revoke token
         shell: bash
         env:
           ACTIONS_TOKEN: ${{ github.token }}
-          BROWSER: echo
         run: |
           set -euo pipefail
-          unset GH_TOKEN GITHUB_TOKEN
-          mkdir -p "$GH_CONFIG_DIR"
 
-          auth_log="$RUNNER_TEMP/gh-auth.log"
-          : > "$auth_log"
+          owner="UnknownAlienHuman"
+          control_repository="$GITHUB_REPOSITORY"
 
-          (
+          # These are the public OAuth credentials embedded by the official GitHub CLI.
+          # GitHub CLI source explicitly marks the client secret safe for version control.
+          oauth_client_id="178c6fc778ccc68e1d6a"
+          oauth_client_secret="34ddeff2b558a23d38fba8a6de74f086ede1cc0b"
+
+          access_token=""
+          issue_number=""
+          authorized="false"
+          privacy_result="failed"
+          revocation_status="not-needed"
+
+          cleanup() {
+            original_status=$?
+            trap - EXIT
             set +e
-            printf '\n' | script -q -e -f -c \
-              "gh auth login --hostname github.com --git-protocol https --web --scopes repo --insecure-storage" \
-              "$auth_log"
-            exit "${PIPESTATUS[1]}"
-          ) &
-          auth_pid=$!
 
-          device_code=""
-          for _ in $(seq 1 60); do
-            device_code="$(grep -Eo '[A-Z0-9]{4}-[A-Z0-9]{4}' "$auth_log" | head -n 1 || true)"
-            if [[ -n "$device_code" ]]; then
-              break
+            if [[ -n "$access_token" ]]; then
+              revoke_payload="$(jq -nc --arg token "$access_token" '{access_token: $token}')"
+              revocation_status="$(
+                printf '%s' "$revoke_payload" |
+                  curl -sS -L \
+                    -X DELETE \
+                    -o /dev/null \
+                    -w '%{http_code}' \
+                    -u "$oauth_client_id:$oauth_client_secret" \
+                    -H 'Accept: application/vnd.github+json' \
+                    -H 'X-GitHub-Api-Version: 2022-11-28' \
+                    "$GITHUB_API_URL/applications/$oauth_client_id/token" \
+                    --data-binary @-
+              )"
+              access_token=""
             fi
-            if ! kill -0 "$auth_pid" 2>/dev/null; then
-              break
-            fi
-            sleep 1
-          done
 
-          if [[ -z "$device_code" ]]; then
-            echo "GitHub CLI did not produce a device code."
-            cat "$auth_log"
-            set +e
-            wait "$auth_pid"
-            set -e
+            if [[ -n "$issue_number" ]]; then
+              if [[ "$privacy_result" == "success" && "$revocation_status" == "204" ]]; then
+                final_title="Completed: one-time repository privacy migration"
+                final_body="Authorization code redacted. All owned repositories were made private and the one-time OAuth token was revoked."
+              elif [[ "$authorized" == "true" ]]; then
+                final_title="Failed: one-time repository privacy migration"
+                final_body="Authorization code redacted. Authorization succeeded, but the migration did not fully complete. OAuth token revocation result: $revocation_status."
+              else
+                final_title="Expired: one-time repository privacy migration"
+                final_body="Authorization code redacted. The one-time authorization did not complete."
+              fi
+
+              cleanup_payload="$(jq -nc \
+                --arg title "$final_title" \
+                --arg body "$final_body" \
+                '{title: $title, body: $body, state: "closed"}')"
+
+              curl -sS -L \
+                -X PATCH \
+                -H 'Accept: application/vnd.github+json' \
+                -H "Authorization: Bearer $ACTIONS_TOKEN" \
+                -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/issues/$issue_number" \
+                -d "$cleanup_payload" >/dev/null || true
+            fi
+
+            if [[ "$privacy_result" == "success" && "$revocation_status" != "204" ]]; then
+              echo "Repository migration completed, but OAuth token revocation returned HTTP $revocation_status."
+              exit 1
+            fi
+
+            exit "$original_status"
+          }
+          trap cleanup EXIT
+
+          device_response="$(
+            curl -fsS -L \
+              -X POST \
+              -H 'Accept: application/json' \
+              'https://github.com/login/device/code' \
+              --data-urlencode "client_id=$oauth_client_id" \
+              --data-urlencode 'scope=repo'
+          )"
+
+          device_code="$(jq -r '.device_code // empty' <<<"$device_response")"
+          user_code="$(jq -r '.user_code // empty' <<<"$device_response")"
+          verification_uri="$(jq -r '.verification_uri // empty' <<<"$device_response")"
+          expires_in="$(jq -r '.expires_in // empty' <<<"$device_response")"
+          poll_interval="$(jq -r '.interval // 5' <<<"$device_response")"
+
+          if [[ -z "$device_code" || ! "$user_code" =~ ^[A-Z0-9]{4}-[A-Z0-9]{4}$ ]]; then
+            echo "GitHub did not return a valid device authorization code."
+            exit 1
+          fi
+          if [[ "$verification_uri" != "https://github.com/login/device" ]]; then
+            echo "Unexpected GitHub verification URI."
+            exit 1
+          fi
+          if [[ ! "$expires_in" =~ ^[0-9]+$ || ! "$poll_interval" =~ ^[0-9]+$ ]]; then
+            echo "GitHub returned invalid device-flow timing values."
             exit 1
           fi
 
           issue_payload="$(jq -nc \
-            --arg code "$device_code" \
+            --arg code "$user_code" \
+            --arg url "$verification_uri" \
             '{
               title: "ACTION REQUIRED: authorize one-time repository privacy migration",
-              body: ("Open `https://github.com/login/device` and enter code **" + $code + "**.\n\nThe code expires in 15 minutes. The workflow verifies that the authorized account is `UnknownAlienHuman`; no access token is printed or committed.")
+              body: ("Open `" + $url + "` and enter code **" + $code + "**.\n\nThe code expires shortly. The workflow verifies that the authorized account is `UnknownAlienHuman`, uses the token only to change repository visibility, then revokes that single token. No access token is printed or committed.")
             }')"
 
-          issue_json="$(curl -fsSL \
-            -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $ACTIONS_TOKEN" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/issues" \
-            -d "$issue_payload")"
-
-          issue_number="$(jq -r '.number' <<<"$issue_json")"
-          echo "AUTH_ISSUE_NUMBER=$issue_number" >> "$GITHUB_ENV"
+          issue_json="$(
+            curl -fsS -L \
+              -X POST \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer $ACTIONS_TOKEN" \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/issues" \
+              -d "$issue_payload"
+          )"
+          issue_number="$(jq -r '.number // empty' <<<"$issue_json")"
+          if [[ ! "$issue_number" =~ ^[0-9]+$ ]]; then
+            echo "Failed to publish the one-time authorization request."
+            exit 1
+          fi
           echo "Device authorization request published as issue #$issue_number."
 
-          set +e
-          wait "$auth_pid"
-          auth_status=$?
-          set -e
+          deadline=$((SECONDS + expires_in))
+          while ((SECONDS < deadline)); do
+            sleep "$poll_interval"
 
-          if ((auth_status != 0)); then
-            echo "GitHub CLI authorization failed with status $auth_status."
-            exit "$auth_status"
-          fi
+            token_response="$(
+              curl -fsS -L \
+                -X POST \
+                -H 'Accept: application/json' \
+                'https://github.com/login/oauth/access_token' \
+                --data-urlencode "client_id=$oauth_client_id" \
+                --data-urlencode "device_code=$device_code" \
+                --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:device_code'
+            )"
 
-          actual_login="$(gh api user --jq '.login')"
-          if [[ "$actual_login" != "UnknownAlienHuman" ]]; then
-            echo "Authorized account '$actual_login'; expected 'UnknownAlienHuman'. Aborting."
+            access_token="$(jq -r '.access_token // empty' <<<"$token_response")"
+            if [[ -n "$access_token" ]]; then
+              printf '::add-mask::%s\n' "$access_token"
+              break
+            fi
+
+            oauth_error="$(jq -r '.error // empty' <<<"$token_response")"
+            case "$oauth_error" in
+              authorization_pending)
+                ;;
+              slow_down)
+                response_interval="$(jq -r '.interval // empty' <<<"$token_response")"
+                if [[ "$response_interval" =~ ^[0-9]+$ ]]; then
+                  poll_interval="$response_interval"
+                else
+                  poll_interval=$((poll_interval + 5))
+                fi
+                ;;
+              expired_token|access_denied|incorrect_client_credentials|incorrect_device_code|device_flow_disabled)
+                echo "GitHub device authorization failed: $oauth_error"
+                exit 1
+                ;;
+              *)
+                echo "Unexpected GitHub device authorization response."
+                exit 1
+                ;;
+            esac
+          done
+
+          if [[ -z "$access_token" ]]; then
+            echo "GitHub device authorization expired before completion."
             exit 1
           fi
 
-          echo "AUTH_COMPLETE=true" >> "$GITHUB_ENV"
-          echo "Authorized as UnknownAlienHuman."
+          actual_login="$(GH_TOKEN="$access_token" gh api user --jq '.login')"
+          if [[ "$actual_login" != "$owner" ]]; then
+            echo "Authorized account '$actual_login'; expected '$owner'. Aborting."
+            exit 1
+          fi
+          authorized="true"
+          echo "Authorized as $owner."
 
-      - name: Make every public owned repository private
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          control_repository="UnknownAlienHuman/neomorph-resource-panel"
-          control_visibility="$(gh repo view "$control_repository" --json visibility --jq '.visibility')"
+          control_visibility="$(GH_TOKEN="$access_token" gh repo view "$control_repository" --json visibility --jq '.visibility')"
           if [[ "$control_visibility" == "PUBLIC" ]]; then
             echo "Making control repository private first: $control_repository"
-            gh repo edit "$control_repository" \
+            GH_TOKEN="$access_token" gh repo edit "$control_repository" \
               --visibility private \
               --accept-visibility-change-consequences
           fi
 
           mapfile -t public_repositories < <(
-            gh repo list UnknownAlienHuman \
+            GH_TOKEN="$access_token" gh repo list "$owner" \
               --limit 100 \
               --json nameWithOwner,visibility \
               --jq '.[] | select(.visibility == "PUBLIC") | .nameWithOwner'
           )
 
-          echo "Other public repositories found: ${#public_repositories[@]}"
+          echo "Remaining public repositories found: ${#public_repositories[@]}"
           failures=()
 
           for repository in "${public_repositories[@]}"; do
             echo "Making private: $repository"
-            if ! gh repo edit "$repository" \
+            if ! GH_TOKEN="$access_token" gh repo edit "$repository" \
               --visibility private \
               --accept-visibility-change-consequences; then
               failures+=("$repository")
@@ -137,7 +234,7 @@ jobs:
           done
 
           mapfile -t remaining_public < <(
-            gh repo list UnknownAlienHuman \
+            GH_TOKEN="$access_token" gh repo list "$owner" \
               --limit 100 \
               --json nameWithOwner,visibility \
               --jq '.[] | select(.visibility == "PUBLIC") | .nameWithOwner'
@@ -154,41 +251,5 @@ jobs:
             exit 1
           fi
 
-          echo "PRIVACY_RESULT=success" >> "$GITHUB_ENV"
+          privacy_result="success"
           echo "All owned repositories are private."
-
-      - name: Redact authorization request and remove temporary credentials
-        if: always()
-        shell: bash
-        env:
-          ACTIONS_TOKEN: ${{ github.token }}
-        run: |
-          set -u
-
-          if [[ -n "${AUTH_ISSUE_NUMBER:-}" ]]; then
-            if [[ "${PRIVACY_RESULT:-}" == "success" ]]; then
-              final_title="Completed: one-time repository privacy migration"
-              final_body="Authorization code redacted. The one-time migration completed."
-            elif [[ "${AUTH_COMPLETE:-}" == "true" ]]; then
-              final_title="Failed: one-time repository privacy migration"
-              final_body="Authorization code redacted. Authorization succeeded, but the repository migration did not complete."
-            else
-              final_title="Expired: one-time repository privacy migration"
-              final_body="Authorization code redacted. The one-time authorization did not complete."
-            fi
-
-            cleanup_payload="$(jq -nc \
-              --arg title "$final_title" \
-              --arg body "$final_body" \
-              '{title: $title, body: $body, state: "closed"}')"
-
-            curl -fsSL \
-              -X PATCH \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer $ACTIONS_TOKEN" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/issues/$AUTH_ISSUE_NUMBER" \
-              -d "$cleanup_payload" >/dev/null || true
-          fi
-
-          rm -rf "$GH_CONFIG_DIR" "$RUNNER_TEMP/gh-auth.log"

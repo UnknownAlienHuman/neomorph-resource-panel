@@ -1,0 +1,22 @@
+name: Emergency cancel obsolete privatization run
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/one-time-private-all.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: one-time-private-all-repositories
+  cancel-in-progress: true
+
+jobs:
+  cancel-predecessor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: No-op cancellation barrier
+        run: echo "Cancelling any obsolete run in this concurrency group."

@@ -1,47 +1,73 @@
-# Agent guide: NeomorphResourcePanel
+# Neomorph Resource Panel agent guide
 
-## Start here
+## Contract
 
-[`NeomorphResourcePanel.toc`](NeomorphResourcePanel.toc) loads `core/DB.lua`, `core/Debug.lua`, `modules/ResourceBar.lua`, then `core/Init.lua`. The file-load namespace is `local ADDON_NAME, NS = ...`; `core/Init.lua` creates the event frame and is the single lifecycle/slash entry point.
+Target Retail 12.1 / Interface `120100`. Preserve the compact resource bar, resource coloring, combat warning threshold, movement lock, numeric text, and slash controls.
 
-## Runtime map
+Read in this order:
 
-- `core/DB.lua:NS.GetDB` applies defaults to `NeomorphResourcePanelDB`; `NS.ResetDB` replaces it with defaults. Durable keys are `locked`, `threshold`, `width`, `height`, `showText`, and point/offset fields.
-- `core/Init.lua` handles `PLAYER_LOGIN` (module check, `ResourceBar:Create`, `ApplyDB`), player power/max/display events, combat transitions, and world entry. It narrows power events to `player` with `RegisterUnitEvent`.
-- `modules/ResourceBar.lua:M:Create` creates `NeomorphResourcePanelFrame`, StatusBar, optional text, drag handlers, and transient color/curve caches. `M:UpdateAll` reads `UnitPowerType`, `UnitPowerMax`, `UnitPower`, and color data; `M:ApplyColor` selects resource color or combat red threshold, with a curve fallback for secret percentages.
-- `core/Debug.lua` owns a bounded local debug log exposed by `/nrp log [n]`; it is not a second persistence system.
+1. `NeomorphResourcePanel.toc`
+2. `core/DB.lua`
+3. `modules/ResourceBar.lua`
+4. `core/Init.lua`
+5. `core/Debug.lua`
+6. `ARCHITECTURE.md`
+7. `tests/test_resource_panel_12_1.lua`
 
-## State and dependencies
+## Power API rules
 
-The only SavedVariables table is `NeomorphResourcePanelDB`; frame, cached resource type/max, color curve, and debug state are runtime. There are no addon/library dependencies. The module observes Blizzard power APIs and uses `C_CurveUtil`/`Enum.LuaCurveType` when available.
+Generated Retail 12.1 docs mark:
 
-## Change routing
+- `UnitPower` as `SecretWhenUnitPowerRestricted`;
+- `UnitPowerMax` as `SecretWhenUnitPowerMaxRestricted`;
+- `UnitPowerPercent` as curve-capable and potentially restricted.
 
-- Defaults/reset/schema: `core/DB.lua`.
-- Event registration/command grammar: `core/Init.lua`; keep power events player-filtered.
-- Bar geometry/drag/text: `ResourceBar:Create`, `ApplyDB`, and drag handlers in `modules/ResourceBar.lua`.
-- Resource reading/formatting: `UpdateAll`, `OnPowerUpdate`, `OnDisplayPower` in `ResourceBar.lua`.
-- Combat threshold/secret handling: `ApplyColor`, `EnsureCombatCurve`, `UpdatePercentScale`; do not compare or format secret values.
-- Diagnostics only: `core/Debug.lua` and `/nrp log`.
+Required order:
 
-## Invariants/risks
+1. call the API;
+2. test accessibility;
+3. only then use `type`, comparison, arithmetic, formatting, indexing, logging, or persistence.
 
-- The bar represents the player resource only; `OnPowerUpdate` must ignore non-player units and irrelevant power tokens.
-- In combat, `UnitPower`/`UnitPowerMax`/`UnitPowerPercent` may return secret values. Preserve `IsSecret` guards, avoid arithmetic/comparison on secrets, and use the curve path or safe fallback.
-- Dragging and reset are blocked in combat via `InCombatLockdown`; preserve position persistence and clamping.
-- `UpdateAll` is event-driven and can be frequent. Keep cached bar/text colors and avoid unnecessary StatusBar writes.
+Do not use `tonumber`, `tostring`, copying, `pcall`, or serialization as declassification.
+
+## Native sinks
+
+Raw current/max power may be forwarded to the addon-owned StatusBar:
+
+```text
+StatusBar:SetMinMaxValues
+StatusBar:SetValue
+```
+
+Do not cache, compare, or format inaccessible values. Do not replace the native sink with a smoothing library that reads/clamps cached values in Lua.
+
+## Curves
+
+The custom color curve uses normalized input `[0, 1]`. `CurveConstants.ScaleTo100` is used only for accessible text output.
+
+A curve result must pass the same access boundary before `GetRGB` and color application. If unavailable, use the ordinary resource color; never infer threshold state from fill geometry, timing, errors, or visibility.
+
+## Events
+
+Use native frame events and `RegisterUnitEvent` for player power updates. Keep the addon event-driven. Do not add polling, combat-log reconstruction, aura scans, or a permanent `OnUpdate`.
+
+Event payloads such as `powerTypeToken` must be access-checked before comparison. An inaccessible token should trigger a safe full refresh, not an error or skipped update.
+
+## UI and SavedVariables
+
+The frame is addon-owned. Drag/reset geometry changes remain blocked in combat. A locked frame must disable mouse interception.
+
+Schema changes belong in `core/DB.lua`; validate all persisted scalars and point names. Never persist gameplay payloads or curve objects.
+
+Debug is opt-in, bounded, and must sanitize every payload before formatting or chat output.
 
 ## Verification
 
-Static checks:
-
-```powershell
-Get-Content _Addons/NeomorphResourcePanel/NeomorphResourcePanel.toc
-rg -n "NeomorphResourcePanelDB|UpdateAll|ApplyColor|RegisterUnitEvent|SlashCmdList|InCombatLockdown|C_CurveUtil" _Addons/NeomorphResourcePanel
+```text
+texlua --luaconly core/DB.lua core/Debug.lua modules/ResourceBar.lua core/Init.lua tests/test_resource_panel_12_1.lua
+texlua tests/test_resource_panel_12_1.lua
 ```
 
-In-game: `/nrp help`, drag/unlock/lock, `/nrp threshold 0.8`, reset out of combat and in combat, switch power forms/resources, test text/value updates, cross the threshold during combat, reload/login, and inspect `/nrp log`. Confirm no arithmetic/taint errors when resource values are restricted.
+Then run the exact live matrix in `Docs/TODO.md`. Do not claim client validation from mocks.
 
-## Unknowns
-
-Exact `UnitPowerPercent` scale and secret-return behavior are client/build dependent; the code probes scale only on safe paths. Validate the curve output visually in the target build.
+Do not add GitHub Actions or other CI unless the owner explicitly changes the repository policy.

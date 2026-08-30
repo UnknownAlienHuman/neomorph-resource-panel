@@ -1,116 +1,128 @@
--- NeomorphResourcePanel
--- Core bootstrap: creates modules, registers events, slash commands.
-
 local ADDON_NAME, NS = ...
-
+local Safe = NS.Safe
 local Debug = NS.Debug
 
-local function EnsureModules()
-    NS.GetDB() -- ensure defaults
+local function Chat(message)
+    message = Safe.String(message) or "<unavailable>"
+    if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then DEFAULT_CHAT_FRAME:AddMessage(message) end
+end
 
+local function EnsureUI()
+    NS.GetDB()
     if not NS.ResourceBar or not NS.ResourceBar.Create then
-        error("NeomorphResourcePanel: ResourceBar module missing")
+        Chat("NRP: ResourceBar module missing")
+        return false
     end
-end
-
-local function CreateUI()
     NS.ResourceBar:Create(UIParent)
-    NS.ResourceBar:ApplyDB()
+    NS.ResourceBar:ApplyDB(true)
+    return true
 end
 
--- Event dispatcher frame
-local E = CreateFrame("Frame")
+local Events = CreateFrame("Frame")
+Events:RegisterEvent("PLAYER_LOGIN")
+Events:RegisterEvent("PLAYER_ENTERING_WORLD")
+Events:RegisterUnitEvent("UNIT_POWER_UPDATE", "player")
+Events:RegisterUnitEvent("UNIT_MAXPOWER", "player")
+Events:RegisterUnitEvent("UNIT_DISPLAYPOWER", "player")
+Events:RegisterEvent("PLAYER_REGEN_DISABLED")
+Events:RegisterEvent("PLAYER_REGEN_ENABLED")
 
-E:SetScript("OnEvent", function(_, event, ...)
+Events:SetScript("OnEvent", function(_, event, ...)
     if event == "PLAYER_LOGIN" then
-        EnsureModules()
-        CreateUI()
-        if Debug then Debug.Log("Loaded") end
+        if EnsureUI() and Debug then Debug.Log("Loaded %s", NS.VERSION) end
         return
     end
 
-    if not NS.ResourceBar or not NS.ResourceBar.frame then
-        return
-    end
+    local resource = NS.ResourceBar
+    if not resource or not resource.frame then return end
 
     if event == "UNIT_POWER_UPDATE" then
-        local unit, powerTypeToken = ...
-        NS.ResourceBar:OnPowerUpdate(unit, powerTypeToken)
+        local _, powerTypeToken = ...
+        resource:OnPowerUpdate(powerTypeToken)
     elseif event == "UNIT_MAXPOWER" then
-        local unit = ...
-        if unit == "player" then NS.ResourceBar:UpdateAll() end
+        resource:UpdateAll()
     elseif event == "UNIT_DISPLAYPOWER" then
-        local unit = ...
-        if unit == "player" then NS.ResourceBar:OnDisplayPower() end
+        resource:OnDisplayPower()
     elseif event == "PLAYER_REGEN_DISABLED" or event == "PLAYER_REGEN_ENABLED" then
-        NS.ResourceBar:OnCombatChange()
+        resource:OnCombatChange()
     elseif event == "PLAYER_ENTERING_WORLD" then
-        NS.ResourceBar:UpdateAll()
+        resource:UpdateAll()
     end
 end)
 
-E:RegisterEvent("PLAYER_LOGIN")
-E:RegisterEvent("PLAYER_ENTERING_WORLD")
-E:RegisterUnitEvent("UNIT_POWER_UPDATE", "player")
-E:RegisterUnitEvent("UNIT_MAXPOWER", "player")
-E:RegisterUnitEvent("UNIT_DISPLAYPOWER", "player")
-E:RegisterEvent("PLAYER_REGEN_DISABLED")
-E:RegisterEvent("PLAYER_REGEN_ENABLED")
+local function Help()
+    Chat("NRP commands:")
+    Chat("  /nrp lock             - toggle move lock")
+    Chat("  /nrp toggle           - show/hide the resource panel")
+    Chat("  /nrp text             - toggle numeric text")
+    Chat("  /nrp threshold <0..1> - set the combat warning threshold")
+    Chat("  /nrp reset            - reset position and settings")
+    Chat("  /nrp debug            - toggle debug logging")
+    Chat("  /nrp log [n]          - print recent debug lines")
+    Chat("  /nrp status           - print current configuration")
+end
 
--- Slash commands
-SLASH_NEOMORPHRESOURCEPANEL1 = "/nrp"
-SlashCmdList["NEOMORPHRESOURCEPANEL"] = function(msg)
-    msg = (msg or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+local function Slash(message)
+    message = Safe.String(message) or ""
+    message = message:lower():gsub("^%s+", ""):gsub("%s+$", "")
     local db = NS.GetDB()
+    local resource = NS.ResourceBar
 
-    if msg == "" or msg == "help" then
-        DEFAULT_CHAT_FRAME:AddMessage("NRP commands:")
-        DEFAULT_CHAT_FRAME:AddMessage("  /nrp lock        - toggle move lock")
-        DEFAULT_CHAT_FRAME:AddMessage("  /nrp reset       - reset position/settings")
-        DEFAULT_CHAT_FRAME:AddMessage("  /nrp threshold x - set threshold (0..1), e.g. /nrp threshold 0.8")
-        DEFAULT_CHAT_FRAME:AddMessage("  /nrp log [n]     - print last n debug lines")
-        return
-    end
-
-    if msg == "lock" then
+    if message == "" or message == "help" then
+        Help()
+    elseif message == "lock" then
         db.locked = not db.locked
-        DEFAULT_CHAT_FRAME:AddMessage("NRP locked: " .. tostring(db.locked))
-        return
-    end
-
-    if msg == "reset" then
-        if InCombatLockdown() then
-            DEFAULT_CHAT_FRAME:AddMessage("NRP: reset blocked in combat")
+        if resource then resource:ApplyDB(false) end
+        Chat("NRP locked: " .. tostring(db.locked))
+    elseif message == "toggle" then
+        db.enabled = not db.enabled
+        if resource then resource:ApplyDB(false) end
+        Chat("NRP enabled: " .. tostring(db.enabled))
+    elseif message == "text" then
+        db.showText = not db.showText
+        if resource then resource:ApplyDB(false); resource:UpdateValue() end
+        Chat("NRP text: " .. tostring(db.showText))
+    elseif message == "reset" then
+        if Safe.InCombat() then
+            Chat("NRP: reset blocked in combat")
             return
         end
         db = NS.ResetDB()
-        if NS.ResourceBar and NS.ResourceBar.frame then
-            NS.ResourceBar.frame:ClearAllPoints()
-            NS.ResourceBar.frame:SetPoint(db.point, UIParent, db.relativePoint, db.x, db.y)
-            NS.ResourceBar:ApplyDB()
-            NS.ResourceBar:UpdateAll()
+        if resource and resource.frame then
+            resource:ApplyDB(true)
+            resource:UpdateAll()
         end
-        DEFAULT_CHAT_FRAME:AddMessage("NRP: reset")
-        return
-    end
-
-    if msg:match("^threshold") then
-        local v = tonumber(msg:match("threshold%s+([%d%.]+)"))
-        if not v or v < 0 or v > 1 then
-            DEFAULT_CHAT_FRAME:AddMessage("NRP: invalid threshold. Use 0..1")
+        Chat("NRP: settings reset")
+    elseif message:match("^threshold") then
+        local value = tonumber(message:match("^threshold%s+([%d%.]+)$"))
+        if not value or value < 0 or value > 1 then
+            Chat("NRP: invalid threshold; use 0..1")
             return
         end
-        db.threshold = v
-        DEFAULT_CHAT_FRAME:AddMessage(string.format("NRP threshold: %.2f", v))
-        if NS.ResourceBar then NS.ResourceBar:UpdateAll() end
-        return
+        db.threshold = value
+        if resource then resource.thresholdCurve = nil; resource:ApplyColor() end
+        Chat(string.format("NRP threshold: %.2f", value))
+    elseif message == "debug" then
+        db.debug = not db.debug
+        Chat("NRP debug: " .. tostring(db.debug))
+        if db.debug and Debug then Debug.Log("Debug enabled") end
+    elseif message:match("^log") then
+        local amount = tonumber(message:match("^log%s+(%d+)$")) or 30
+        if Debug then Debug.Dump(amount) end
+    elseif message == "status" then
+        Chat(string.format(
+            "NRP v%s enabled=%s locked=%s threshold=%.2f size=%dx%d text=%s debug=%s",
+            NS.VERSION, tostring(db.enabled), tostring(db.locked), db.threshold,
+            db.width, db.height, tostring(db.showText), tostring(db.debug)
+        ))
+    else
+        Chat("NRP: unknown command; use /nrp help")
     end
-
-    if msg:match("^log") then
-        local n = tonumber(msg:match("log%s+(%d+)") or "30")
-        if NS.Debug then NS.Debug.Dump(n) end
-        return
-    end
-
-    DEFAULT_CHAT_FRAME:AddMessage("NRP: unknown command. /nrp help")
 end
+
+SLASH_NEOMORPHRESOURCEPANEL1 = "/nrp"
+SlashCmdList.NEOMORPHRESOURCEPANEL = Slash
+
+NS.EventFrame = Events
+NS.SlashCommand = Slash
+NS.EnsureUI = EnsureUI

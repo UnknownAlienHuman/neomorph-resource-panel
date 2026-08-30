@@ -1,9 +1,10 @@
-## Interface: 120001, 120005
-## Title: NeomorphResourcePanel
-## Notes: Minimal resource-colored power bar; turns red in combat above a threshold.
+## Interface: 120100
+## Title: Neomorph Resource Panel
+## Notes: Event-driven player power bar with resource coloring and an optional combat threshold warning.
 ## Author: Neomorph
-## Version: 0.1.1
+## Version: 0.2.0
 ## SavedVariables: NeomorphResourcePanelDB
+## X-Verified-Build: 12.1.0.69497
 
 core/DB.lua
 core/Debug.lua
